@@ -1,0 +1,365 @@
+# ROS client library for Python
+import rclpy
+
+# Used to create nodes
+from rclpy.node import Node
+
+# Enables pauses in the execution of code
+from time import sleep
+
+# Enables the use of the string message type
+from std_msgs.msg import String
+
+# Enables the use of the float message type
+from std_msgs.msg import Float64
+
+# Enables the use of the float message type
+from sensor_msgs.msg import Image
+
+# Twist msg type is used to represent linear and angular velocities
+from geometry_msgs.msg import Twist
+
+# Pose messages
+from geometry_msgs.msg import Pose 
+
+# Vector3 messages
+from geometry_msgs.msg import Vector3 
+
+# Position, orientation, linear velocity, angular velocity
+from nav_msgs.msg import Odometry
+
+# Allows conversion between ROS and OpenCV Images
+from cv_bridge import CvBridge
+
+import math
+import numpy as np
+import cv2
+import time
+from collections import deque
+
+class Drive(Node):
+  """
+  This is the Drive class we will use. 
+  The class is a subclass of the Node class for ROS2.
+  This class will control the robot motion
+  """
+  
+  def __init__(self):
+    """
+    This is the class's constructor, used to initialize the node
+    """
+    # Initiate the parent Node class's constructor and give it a name
+    super().__init__('drive')
+    
+    ########### SETUP NODE'S SUBSCRIBERS & PUBLISHERS ############
+    
+    '''
+    # Create a subscriber to messages of type
+    # nav_msgs/Odometry (position and orientation of the robot)
+    # The maximum number of queued messages is 10.
+    # We will define the class method (function) odom_callback
+    # to receive these messages.  
+    self.odom_subscriber = self.create_subscription(
+                           Odometry,
+                           '/odom',
+                           self.odom_callback,
+                           5)
+    '''
+                   
+    # Create a subscriber to messages of type 
+    # Float64 (double), to listen for distance data values.
+    # The maximum number of queued messages is 10.
+    # We will define the class method (function) distance_callback
+    # to receive these messages.
+    self.distance_subscriber = self.create_subscription(
+                               Float64,
+                               '/distance',
+                               self.distance_callback,
+                               3)
+    
+    # Create a subscriber to messages of type 
+    # sensor_msgs/Image.msg, to listen for OpenCV Images.
+    # The maximum number of queued messages is 10.
+    # We will define the class method (function) camera_callback
+    # to receive these messages.
+    self.camera_subscriber = self.create_subscription(
+                               Image,
+                               '/camera_image',
+                               self.camera_callback,
+                               5)
+                 
+    # Create a subscriber to messages of type 
+    # geometry_msgs/Twist.msg, to listen for velocity commands
+    # The maximum number of queued messages is 10.
+    # We will define the class method (function) velocity_callback
+    # to receive these messages.
+    self.velocity_subscriber = self.create_subscription(
+                               Twist,
+                               '/commands/velocity',
+                               self.velocity_callback,
+                               3)
+                               
+    # Create a publisher to publish the desired 
+    # linear and angular velocity of the robot (in the
+    # robot chassis coordinate frame) to the /commands/velocity topic. 
+    # Using the diff_drive plugin enables the robot model to read this
+    # topic and execute the motion.
+    self.publisher_ = self.create_publisher(
+                      Twist, 
+                      '/commands/velocity', 
+                      3)
+  
+    ################### ROBOT & CAMERA CONTROL PARAMETERS ##################
+
+    # Current position and orientation of the robot and velocities in the global 
+    # reference frame. We'll initialize to zero, but values will
+    # subsequently be set from odometry readings.
+    self.current_x = 0.0
+    self.current_y = 0.0
+    self.current_yaw = 0.0
+    self.current_v = 0.0
+    self.current_yaw_rate = 0.0
+    
+    self.control_v = 0.0
+    self.control_yaw_rate = 0.0
+    
+    # Define and initialize a queue and other variables used for 
+    # averaging a circle's center
+    self.maxLength = 7
+    self.qCX = deque(maxlen=self.maxLength)
+    self.qCY = deque(maxlen=self.maxLength)
+    self.maxCX = 0
+    self.maxCY = 0
+    self.out_of_bounds = 0
+    self.turn_speed = 0.0
+    self.fwd_speed = 0.0
+    
+    # Distance read from the ultrasonic sensor
+    self.distance_cm = 0.0
+    
+    # Create the bridge between ROS and OpenCV
+    self.br = CvBridge()
+    
+    #Create a timer that calls the get_distance() function 20 
+    #times per second. This allows for proper topic publishing
+    self.create_timer(0.06, self.robot_control)
+                              
+  ###########  SUBSCRIPTION CALLBACK & HELPER FUNCTIONS ########
+  '''
+  def odom_callback(self, msg):
+    """
+    This callback function receives odometry msg information (/odom)
+    containing the position and orientation
+    of the robot in the global reference frame. 
+    The position is x, y, z.
+    The orientation is a x,y,z,w quaternion, which are converted 
+    to euler angles by calling the euler_from_quaternion function 
+    defined below. 
+    """                    
+    roll, pitch, yaw = self.euler_from_quaternion(
+      msg.pose.pose.orientation.x,
+      msg.pose.pose.orientation.y,
+      msg.pose.pose.orientation.z,
+      msg.pose.pose.orientation.w)
+ 
+    self.current_x = msg.pose.pose.position.x
+    self.current_y = msg.pose.pose.position.y
+    self.current_yaw = yaw
+    
+    # Call robot_control function to start processing 
+    # (change in pose may result in change in state)
+    self.robot_control()
+  '''  
+  
+  '''
+  def euler_from_quaternion(self, x, y, z, w):
+    """
+    Convert a quaternion into euler angles (roll, pitch, yaw)
+    roll is rotation around x in radians (counterclockwise)
+    pitch is rotation around y in radians (counterclockwise)
+    yaw is rotation around z in radians (counterclockwise)
+    """
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = math.atan2(t0, t1)
+ 
+    t2 = +2.0 * (w * y - z * x)
+    t2 = +1.0 if t2 > +1.0 else t2
+    t2 = -1.0 if t2 < -1.0 else t2
+    pitch_y = math.asin(t2)
+ 
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = math.atan2(t3, t4)
+ 
+    return roll_x, pitch_y, yaw_z # in radians
+  '''
+    
+  def distance_callback(self, msg):
+    """
+    This callback function receives distance data information 
+    (/distance/data) from the ultrasonic sensor ping.py node.
+    """
+    self.distance_cm = msg.data
+    
+    
+  def camera_callback(self, msg):
+    """
+    This callback function receives camera Image information 
+    (/camera_image) from the ultrasonic sensor ping.py node.
+    """
+    # Convert ROS Image message to OpenCV image
+    frame = self.br.imgmsg_to_cv2(msg)
+    
+    # Convert image from RGB to HSV values to differentiate the hues of the road
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    # Some values for the orange line
+    dark_orange = np.array([7, 70, 70])
+    light_orange = np.array([16, 255, 255])
+    
+    # apply these thresholds and discard anything outside of that range
+    mask = cv2.inRange(hsv, dark_orange, light_orange)
+    
+    # find the contours using the threshold
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # apply the contours to the image so we can see what it's doing
+    cv2.drawContours(frame, cnts, -1, (0,255,0) ,2)
+    
+    # Grab the dimensions of the image frame (help determine where the robot is pointing)
+    height, width = frame.shape[:2]
+    img_area = height*width
+    # maxContourSize = img_area / 2.0     used in lab05
+    
+    # Process contours. 
+    count = 0; sumX = 0; sumY = 0
+    for c in cnts:
+       if cv2.contourArea(c)>100000:
+          count += 1 
+          M = cv2.moments(c)  # provides image moments (see function help)
+          cX = int(M["m10"] / M["m00"]) # calculate x centroid of contour
+          cY = int(M["m01"] / M["m00"]) # calculate y centroid of contour
+          sumX += cX  # add to x and y sums to calculate average centroid later
+          sumY += cY
+       if count > 0: 
+       # make sure at least one road segment found or that the segment is smaller than half
+       # of the field of view
+          grandCX = int(float(sumX) / float(count))
+          # Dracula
+          grandCY = int(float(sumY) / float(count))
+          
+          self.qCX.appendleft(grandCX)
+          self.qCY.appendleft(grandCY)
+          
+          # calculate average of centroids in queue 
+          # i.e., moving average of last 6 centroids
+          self.maxCX = int(np.average(self.qCX))
+          self.maxCY = int(np.average(self.qCY))
+          
+          self.out_of_bounds = 0
+       else:	# if no large road segment is found, stop the robot
+          self.out_of_bounds = 1
+    
+    # Draw a circle onto the image with center (maxCX, maxCY) calculated above 
+    cv2.circle(frame, (self.maxCX, self.maxCY), 15, (0,0,255), 5)
+    
+    #print("Distance: %.2f" % self.distance_cm)
+    #print("Out of bounds : %d" % self.out_of_bounds)
+    
+    if(self.distance_cm < 35.0):
+    	self.fwd_speed = 0.0		# if there's an obstacle, stop
+    	self.turn_speed = 0.0
+    	
+    else:
+    
+    	if(self.out_of_bounds):
+    	    self.fwd_speed = 0.0	# if no large contour is found, spin until one is
+    	    self.turn_speed = 0.5
+    	    
+    	else:
+    	
+    	    if(self.maxCX < 0.425*width):	# if the circle (center of contours) is on the left side
+    	        self.fwd_speed = 0.0		# of the image frame, follow it and turn left
+    	        self.turn_speed = 0.3
+    	    elif(self.maxCX > 0.575*width):	# vice-versa for right
+    	        self.fwd_speed = 0.0
+    	        self.turn_speed = -0.3
+    	    else:				# if the circle is sufficiently in the middle of the image
+    	        self.fwd_speed = 0.25		# frame, drive straight
+    	        self.turn_speed = 0.0
+    
+    # Show image frame and contours
+    # Will be commented out for demonstration to reserve CPU resources
+    # cv2.imshow("camera", frame)
+    # cv2.waitKey(1)
+    
+    
+  def velocity_callback(self, msg):
+    """
+    This callback function listens to the velocity commands (/commands/velocity). 
+    In particular, we only need the x velocity and angular velocity 
+    around the z axis (yaw rate)both in the robot's reference frame
+    [v,yaw_rate]
+    [meters/second, radians/second]
+    """
+    # Current Forward velocity in the robot's reference frame
+    self.current_v = msg.linear.x
+ 
+    # Current Angular velocity around the robot's z axis
+    self.current_yaw_rate = msg.angular.z
+    
+  def robot_control(self):
+    """
+    This method handles controlling the robot state and its
+    movement. Unlike the other functions, you will need to
+    write the logic for this function
+    """
+   
+    # Here would be some logic utilizing odometry values, but
+    # we cut it out considering we're not using any form of mapping
+    
+    # Because of this, odometry subscriber and helper function have been 
+    # commented out above in order to reserve CPU resources
+    	
+    # Create a geometry_msgs/Twist message
+    msg = Twist()
+    msg.linear.x = self.fwd_speed
+    msg.linear.y = 0.0
+    msg.linear.z = 0.0
+    msg.angular.x = 0.0
+    msg.angular.y = 0.0
+    msg.angular.z = self.turn_speed
+ 
+    # Send velocity command to the robot
+    self.publisher_.publish(msg)
+
+  
+########### MAIN FUNCTION ###############
+# The main function is called automatically when the 
+# drive node is launched. It is th entry point 
+# for the node
+
+def main(args=None):
+    
+    # Initialize rclpy library
+    rclpy.init(args=args)
+     
+    # Create the node (initializes an instance of the drive class)
+    drive = Drive()
+    
+    # Spin the node so the callback function is called
+    # Pull messages from any topics this node is subscribed to
+    # Publish any pending messages to the topics
+    rclpy.spin(drive)
+    
+    # Destroy the node explicitly
+    # (optional - otherwise it will be done automatically
+    # when the garbage collector destroys the node object)
+    drive.destroy_node()
+    
+    # Shutdown the ROS client library for Python
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
